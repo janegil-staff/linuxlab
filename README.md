@@ -1,48 +1,74 @@
-# Qup Terminal — backend (step 1)
+# Qup Terminal — backend (auth + DB)
 
-Bare PTY-over-WebSocket pipe. Spawns a real shell per WebSocket connection and
-streams it to a browser xterm.js test page. **No auth, no sandbox yet** — run on
-localhost only.
+Multi-user terminal backend. REST auth + MongoDB + JWT-authenticated
+PTY-over-WebSocket. **Sandbox and SSH-out are the next steps** — until the
+sandbox lands the shell runs as the server's own user, so keep this on
+localhost / a trusted network.
 
-## Run
-
-```bash
-npm install
-npm start
-# open http://127.0.0.1:3000  → you should get a live shell
-```
-
-Dev mode (auto-restart on file change):
+## Setup
 
 ```bash
-npm run dev
+npm install                 # postinstall fixes node-pty's spawn-helper perms
+cp .env.example .env        # then fill in the values
 ```
 
-## Config (env vars)
+Fill `.env`:
+- `MONGODB_URI` — local Mongo or Atlas
+- `JWT_SECRET` — `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`
+- `APP_ENCRYPTION_KEY` — `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`
+- `SHELL_BIN` — `/bin/zsh` on macOS
 
-| var         | default      | meaning                              |
-|-------------|--------------|--------------------------------------|
-| `PORT`      | `3000`       | HTTP + WS port                       |
-| `HOST`      | `127.0.0.1`  | bind address (keep localhost!)       |
-| `SHELL_BIN` | `bash`       | shell to spawn (`zsh`, `powershell`) |
+Run (Node 20+ can load the env file directly):
 
-## Note on `node-pty`
+```bash
+node --env-file=.env src/server.js
+```
 
-`node-pty` is a **native module** — it compiles on install and needs build
-tools present:
+You need MongoDB running. Quick local option: `brew install mongodb-community`
+and `brew services start mongodb-community`, or use a free Atlas cluster.
 
-- **macOS:** Xcode Command Line Tools (`xcode-select --install`). On your M2,
-  it builds for arm64 automatically.
-- **Linux:** `python3`, `make`, `g++` (`build-essential`).
-- **Windows:** windows-build-tools / VS build tools.
+## REST API
 
-If `npm install` fails on node-pty, that's the cause — install the build tools
-and re-run.
+| Method | Path             | Body                   | Returns                               |
+|--------|------------------|------------------------|---------------------------------------|
+| POST   | `/auth/register` | `{ email, password }`  | `{ accessToken, refreshToken, user }` |
+| POST   | `/auth/login`    | `{ email, password }`  | `{ accessToken, refreshToken, user }` |
+| POST   | `/auth/refresh`  | `{ refreshToken }`     | `{ accessToken, refreshToken }`       |
+| GET    | `/auth/me`       | (Bearer access token)  | `{ user }`                            |
+| GET    | `/health`        | —                      | `{ ok: true }`                        |
 
-## What's next (from the spec)
+## Terminal socket
 
-2. Expo xterm WebView client (replace this test page)
-3. Accessory key bar + resize handling
-4. JWT auth on the socket upgrade
-5. Sessions + MongoDB
-6. Docker-per-session sandbox  ← required before any non-localhost use
+```
+ws://HOST:3000/term?token=<accessToken>
+```
+
+The token is verified at the upgrade; no token or a bad/expired one means 401
+and no shell. Each connection records a Session (metadata only, never the
+transcript).
+
+## Quick manual test
+
+```bash
+curl -s localhost:3000/auth/register -H 'content-type: application/json' \
+  -d '{"email":"me@example.com","password":"hunter2hunter2"}'
+```
+
+## What's next
+
+- Docker-per-session sandbox (required before public exposure)
+- SSH-out: /hosts CRUD (encrypted creds) + an ssh session kind via ssh2
+- Rate limiting + concurrent-session caps
+
+## Files added this step
+
+```
+src/lib/db.js            Mongoose connection
+src/lib/tokens.js        JWT sign/verify (access + refresh)
+src/lib/crypto.js        AES-256-GCM for secrets at rest
+src/middleware/auth.js   requireAuth (Bearer)
+src/routes/auth.js       register/login/refresh/me
+src/models/User.js       accounts
+src/models/Host.js       saved SSH targets (encrypted creds) — used next step
+src/models/Session.js    session metadata
+```

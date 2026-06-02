@@ -15,24 +15,28 @@
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import os from "node:os";
 
 import express from "express";
 import { WebSocketServer } from "ws";
-import pty from "node-pty";
 
 import { connectDb } from "./lib/db.js";
 import { verifyToken } from "./lib/tokens.js";
 import authRoutes from "./routes/auth.js";
+import hostsRoutes from "./routes/hosts.js";
 import { Session } from "./models/Session.js";
+import { Host } from "./models/Host.js";
+import { decrypt } from "./lib/crypto.js";
+import { openSshSession } from "./lib/ssh.js";
+import {
+  spawnSandbox,
+  killContainer,
+  SESSION_TIMEOUT_MS,
+} from "./lib/sandbox.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || "127.0.0.1";
-const SHELL =
-  process.env.SHELL_BIN ||
-  (os.platform() === "win32" ? "powershell.exe" : "bash");
 
 // ── Message protocol ─────────────────────────────────────────────────────────
 // client → server: JSON control { type:"resize"|"ping" } else raw keystrokes
@@ -44,6 +48,7 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 app.use("/auth", authRoutes);
+app.use("/hosts", hostsRoutes);
 
 const server = http.createServer(app);
 
@@ -71,8 +76,9 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // Authenticated — carry the user id into the connection.
+  // Authenticated — carry the user id (and optional hostId) into the connection.
   req.userId = payload.sub;
+  req.hostId = url.searchParams.get("hostId") || null;
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit("connection", ws, req);
   });
@@ -80,14 +86,19 @@ server.on("upgrade", (req, socket, head) => {
 
 wss.on("connection", async (ws, req) => {
   const userId = req.userId;
-  console.log(`[+] terminal session opened (user ${userId})`);
+  const hostId = req.hostId;
+  const isSsh = !!hostId;
+  console.log(
+    `[+] ${isSsh ? "ssh" : "sandbox"} session opened (user ${userId})`
+  );
 
   // Record a Session row (metadata only — never the transcript).
   let sessionDoc = null;
   try {
     sessionDoc = await Session.create({
       userId,
-      kind: "sandbox",
+      kind: isSsh ? "ssh" : "sandbox",
+      hostId: isSsh ? hostId : undefined,
       status: "active",
       cols: 80,
       rows: 24,
@@ -95,33 +106,83 @@ wss.on("connection", async (ws, req) => {
   } catch (e) {
     console.error("session record failed:", e.message);
   }
-  // Spawn a PTY running the shell. cwd defaults to home; env passed through.
+
   let shell;
-  try {
-    shell = pty.spawn(SHELL, [], {
-      name: "xterm-color",
-      cols: 80,
-      rows: 24,
-      cwd: process.env.HOME || process.cwd(),
-      env: process.env,
-    });
-  } catch (err) {
-    // Common cause: node-pty's spawn-helper lost its +x bit, or a Node/ABI
-    // mismatch. Tell the client and close THIS socket — don't crash the server.
-    console.error("PTY spawn failed:", err.message);
-    console.error(
-      "  → try: chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper"
-    );
-    if (ws.readyState === ws.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: "error",
-          message: `Failed to start shell: ${err.message}`,
-        })
-      );
-      ws.close();
+  let containerName = null;
+
+  if (isSsh) {
+    // ── SSH to the user's own server ───────────────────────────────────────
+    try {
+      const host = await Host.findOne({ _id: hostId, userId });
+      if (!host) throw new Error("host not found");
+      const secret = decrypt(host.secretEnc);
+      shell = await openSshSession({
+        host: host.host,
+        port: host.port,
+        username: host.username,
+        authType: host.authType,
+        secret,
+        cols: 80,
+        rows: 24,
+      });
+      host.lastUsedAt = new Date();
+      host.save().catch(() => {});
+      console.log(`[+] ssh → ${host.username}@${host.host}:${host.port}`);
+    } catch (err) {
+      console.error("ssh connect failed:", err.message);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: `SSH connection failed: ${err.message}`,
+          })
+        );
+        ws.close();
+      }
+      return;
     }
-    return;
+  } else {
+    // ── Disposable, locked-down Docker container ───────────────────────────
+    try {
+      const res = spawnSandbox({ cols: 80, rows: 24 });
+      shell = res.shell;
+      containerName = res.name;
+      if (sessionDoc) {
+        sessionDoc.containerId = containerName;
+        sessionDoc.save().catch(() => {});
+      }
+      console.log(`[+] sandbox container ${containerName} (user ${userId})`);
+    } catch (err) {
+      console.error("sandbox spawn failed:", err.message);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: `Failed to start session: ${err.message}`,
+          })
+        );
+        ws.close();
+      }
+      return;
+    }
+  }
+
+  // Hard wall-clock timeout for both kinds.
+  let timeoutHandle = null;
+  if (SESSION_TIMEOUT_MS > 0) {
+    timeoutHandle = setTimeout(() => {
+      console.log(`[!] session timeout (user ${userId})`);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Session timed out and was closed.",
+          })
+        );
+        ws.close();
+      }
+      if (containerName) killContainer(containerName);
+    }, SESSION_TIMEOUT_MS);
   }
 
   // PTY → client: stream output as raw bytes.
@@ -181,11 +242,18 @@ wss.on("connection", async (ws, req) => {
   });
 
   const cleanup = async (status, exitCode) => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
     try {
       shell.kill();
     } catch {
       /* already gone */
     }
+    // --rm usually removes the container on exit, but force-kill defensively in
+    // case the client vanished while the shell was mid-command.
+    killContainer(containerName);
     if (sessionDoc) {
       try {
         sessionDoc.status = status || "ended";
@@ -214,8 +282,7 @@ async function start() {
     console.log(`Qup Terminal backend`);
     console.log(`  HTTP  : http://${HOST}:${PORT}  (/auth, /health)`);
     console.log(`  WS    : ws://${HOST}:${PORT}/term?token=<accessJWT>`);
-    console.log(`  Shell : ${SHELL}`);
-    console.log(`  Auth  : ON   Sandbox: OFF (next step)`);
+    console.log(`  Auth  : ON   Sandbox: ON (Docker per session)`);
   });
 }
 
