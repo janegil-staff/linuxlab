@@ -12,20 +12,33 @@ import { LESSONS, getLesson, verifyInContainer } from "../lib/lessons.js";
 const router = express.Router();
 router.use(requireAuth);
 
-// GET /lessons — curriculum + this user's completed lesson IDs
+// GET /lessons?offset=0&limit=20 — paginated curriculum + user progress
 router.get("/", async (req, res) => {
   const user = await User.findById(req.userId).select("completedLessons");
   const completed = user?.completedLessons || [];
+
+  const total = LESSONS.length;
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+  const page = LESSONS.slice(offset, offset + limit).map((l) => ({
+    id: l.id,
+    title: l.title,
+    explanation: l.explanation,
+    task: l.task,
+    hint: l.hint,
+    done: completed.includes(l.id),
+  }));
+
   res.json({
-    completed,
-    lessons: LESSONS.map((l) => ({
-      id: l.id,
-      title: l.title,
-      explanation: l.explanation,
-      task: l.task,
-      hint: l.hint,
-      done: completed.includes(l.id),
-    })),
+    lessons: page,
+    total,
+    offset,
+    limit,
+    hasMore: offset + limit < total,
+    completedCount: completed.filter((id) =>
+      LESSONS.some((l) => l.id === id)
+    ).length,
   });
 });
 
