@@ -544,6 +544,237 @@ export const LESSONS = [
     pass: "PASS",
     hint: "ls /does-not-exist 2> err.txt",
   },
+  {
+    id: "32-perms-view",
+    unit: "u6-permissions",
+    title: "Read file permissions",
+    explanation:
+      "Every file has permissions shown by `ls -l` as something like " +
+      "`-rwxr-xr--`. The letters mean read (r), write (w), execute (x), in " +
+      "three groups: owner, group, everyone else. View them with a long listing.",
+    task:
+      "Make a file, then view its permissions with a long listing\n" +
+      "(hint: touch file.txt ; ls -l)",
+    check: 'grep -qE "ls +-[a-z]*l" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "Run:  ls -l",
+  },
+  {
+    id: "33-chmod-num",
+    unit: "u6-permissions",
+    title: "Set permissions with numbers",
+    explanation:
+      "`chmod` changes permissions. The numeric form uses three digits: 4=read, " +
+      "2=write, 1=execute, added together. So `644` means owner read+write (6), " +
+      "group and others read-only (4).",
+    task:
+      "Make a file  perm.txt  and set its permissions to exactly  644\n" +
+      "(hint: touch perm.txt ; chmod 644 perm.txt)",
+    check:
+      'test "$(stat -c %a ~/perm.txt 2>/dev/null)" = "644" && echo PASS',
+    pass: "PASS",
+    hint: "chmod 644 perm.txt",
+  },
+  {
+    id: "34-chmod-x",
+    unit: "u6-permissions",
+    title: "Make a file executable",
+    explanation:
+      "To run a script, it needs the execute (x) permission. `chmod +x` adds it. " +
+      "This is the step people forget when a script 'won't run'.",
+    task:
+      "Make a file  script.sh  and give it execute permission\n" +
+      "(hint: touch script.sh ; chmod +x script.sh)",
+    check: "test -x ~/script.sh && echo PASS",
+    pass: "PASS",
+    hint: "chmod +x script.sh",
+  },
+  {
+    id: "35-chmod-sym",
+    unit: "u6-permissions",
+    title: "Permissions the symbolic way",
+    explanation:
+      "Besides numbers, chmod has a symbolic form: `u+x` adds execute for the " +
+      "user (owner), `g-w` removes write for the group, and so on. It's often " +
+      "clearer for small changes.",
+    task:
+      "Make a file  sym.sh  and add execute for the owner using the symbolic form\n" +
+      "(hint: touch sym.sh ; chmod u+x sym.sh)",
+    check:
+      'test -x ~/sym.sh && grep -qE "chmod +u\\+x" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "chmod u+x sym.sh",
+  },
+  {
+    id: "36-chown",
+    unit: "u6-permissions",
+    title: "Who owns a file?",
+    explanation:
+      "`chown` changes a file's owner (and `chgrp` its group). Changing owner " +
+      "usually needs admin rights, but it's important to know it exists. Run it " +
+      "to set the owner of a file to your own user.",
+    task:
+      "Make a file  owned.txt , then run chown to set its owner to  sandbox\n" +
+      "(hint: touch owned.txt ; chown sandbox owned.txt)",
+    check: 'grep -qE "(^| )chown +" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "chown sandbox owned.txt",
+  },
+  {
+    id: "37-run-script",
+    unit: "u6-permissions",
+    title: "Write and run a script",
+    explanation:
+      "Putting it together: a script is a file of commands. Make it executable, " +
+      "then run it with `./name`. The `./` tells the shell to run the file right " +
+      "here.",
+    task:
+      "Make  hello.sh  that writes the word  ran  into  out.txt , make it " +
+      "executable, and run it\n" +
+      "(hint: printf '#!/bin/bash\\necho ran > out.txt\\n' > hello.sh ; chmod +x hello.sh ; ./hello.sh)",
+    check:
+      'test -x ~/hello.sh && grep -qx ran ~/out.txt 2>/dev/null && echo PASS',
+    pass: "PASS",
+    hint: "chmod +x hello.sh   then   ./hello.sh",
+  },
+  {
+    id: "38-ps",
+    unit: "u7-processes",
+    title: "See running programs",
+    explanation:
+      "`ps` lists processes (running programs). `ps aux` shows all of them with " +
+      "details — who started them and how much they're using. It's how you see " +
+      "what's running.",
+    task:
+      "List the running processes\n" +
+      "(hint: ps aux)",
+    check: 'grep -qE "(^| )ps( |$)" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "Run:  ps aux",
+  },
+  {
+    id: "39-top",
+    unit: "u7-processes",
+    title: "Watch the system live",
+    explanation:
+      "`top` shows a live, updating view of processes and how much CPU and " +
+      "memory each uses — like a task manager for the terminal. Press `q` to " +
+      "quit it.",
+    task:
+      "Open the live process viewer, then quit it with q\n" +
+      "(hint: top   — then press q)",
+    check: 'grep -qE "(^| )top( |$)|htop" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "Run:  top   (press q to exit)",
+  },
+  {
+    id: "40-kill",
+    unit: "u7-processes",
+    title: "Stop a process",
+    explanation:
+      "Sometimes a program needs stopping. Start a long-running command in the " +
+      "background with `&`, then stop it with `kill`. (`kill %1` stops the first " +
+      "background job.)",
+    task:
+      "Start  sleep 300  in the background, then kill it\n" +
+      "(hint: sleep 300 & ; then: kill %1)",
+    check:
+      'grep -qE "(^| )kill( |$)" ~/.bash_history && grep -qE "sleep" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "sleep 300 &   then   kill %1",
+  },
+  {
+    id: "41-disk",
+    unit: "u7-processes",
+    title: "Check disk space",
+    explanation:
+      "`df -h` shows how much disk space is free (in human-readable sizes). " +
+      "`du` shows how much space files/folders use. Essential when things fill " +
+      "up.",
+    task:
+      "Show free disk space in human-readable form\n" +
+      "(hint: df -h)",
+    check: 'grep -qE "(^| )d[fu]( |$| -)" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "Run:  df -h",
+  },
+  {
+    id: "42-env-var",
+    unit: "u7-processes",
+    title: "Use a variable",
+    explanation:
+      "The shell can store values in variables. `NAME=value` sets one, and " +
+      "`$NAME` reads it back. This is the foundation of scripting.",
+    task:
+      "Set a variable  MYVAR  to  hello , then save its value into  var.txt\n" +
+      "(hint: MYVAR=hello ; echo $MYVAR > var.txt)",
+    check: 'grep -qx hello ~/var.txt 2>/dev/null && echo PASS',
+    pass: "PASS",
+    hint: "MYVAR=hello   then   echo $MYVAR > var.txt",
+  },
+  {
+    id: "43-nano",
+    unit: "u8-scripting",
+    title: "Edit with nano",
+    explanation:
+      "`nano` is a friendly text editor in the terminal. Open a file, type, " +
+      "then save with Ctrl-O (Enter) and exit with Ctrl-X. It's the easiest way " +
+      "to edit files by hand.",
+    task:
+      "Open  notes.txt  in nano (you can type something, save with Ctrl-O, exit " +
+      "with Ctrl-X)\n" +
+      "(hint: nano notes.txt)",
+    check: 'grep -qE "(^| )nano( |$)" ~/.bash_history && echo PASS',
+    pass: "PASS",
+    hint: "Run:  nano notes.txt   (Ctrl-O to save, Ctrl-X to exit)",
+  },
+  {
+    id: "44-write-script",
+    unit: "u8-scripting",
+    title: "Write your first script",
+    explanation:
+      "A script starts with a 'shebang' line — `#!/bin/bash` — telling the " +
+      "system to run it with bash. Below that go your commands, one per line.",
+    task:
+      "Create  myscript.sh  starting with the line  #!/bin/bash  followed by an " +
+      "echo command\n" +
+      "(hint: printf '#!/bin/bash\\necho hi\\n' > myscript.sh)",
+    check:
+      'head -n1 ~/myscript.sh 2>/dev/null | grep -qE "^#!/bin/bash" && echo PASS',
+    pass: "PASS",
+    hint: "printf '#!/bin/bash\\necho hi\\n' > myscript.sh",
+  },
+  {
+    id: "45-script-var",
+    unit: "u8-scripting",
+    title: "A script with a variable",
+    explanation:
+      "Putting variables in a script makes it flexible. Set a variable inside " +
+      "the script and use it in the output.",
+    task:
+      "Write and run a script that sets  NAME=world  and writes  hello world  " +
+      "into  vout.txt\n" +
+      "(hint: put NAME=world and echo \"hello $NAME\" > vout.txt in a script, chmod +x, run it)",
+    check: 'grep -q "hello world" ~/vout.txt 2>/dev/null && echo PASS',
+    pass: "PASS",
+    hint: 'In the script: NAME=world  then  echo "hello $NAME" > vout.txt',
+  },
+  {
+    id: "46-loop",
+    unit: "u8-scripting",
+    title: "Repeat with a loop",
+    explanation:
+      "A `for` loop repeats commands. `for i in 1 2 3; do ... done` runs the " +
+      "body once for each value. Loops are where the terminal starts saving you " +
+      "real time.",
+    task:
+      "Use a for loop to create three files:  loop1.txt , loop2.txt , loop3.txt\n" +
+      "(hint: for i in 1 2 3; do touch loop$i.txt; done)",
+    check:
+      'test -f ~/loop1.txt && test -f ~/loop2.txt && test -f ~/loop3.txt && echo PASS',
+    pass: "PASS",
+    hint: "for i in 1 2 3; do touch loop$i.txt; done",
+  },
 ];
 
 export function getLesson(id) {

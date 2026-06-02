@@ -88,3 +88,21 @@ per-unit progress (done/total).
 ≈52 total, ~42 left to author. Write in careful batches; validate each check
 against correct AND incorrect states before shipping (no false passes). Mix
 side-effect checks (file artifacts) and history checks (traceless commands).
+
+## COMPLETE — 50 exercises across all 8 units
+
+Full beginner curriculum authored and check-validated (in bash, against correct
+AND incorrect states). Counts: Getting around 7, Files 9, Viewing 7, Searching 6,
+Pipes 6, Permissions 6, Processes 5, Scripting 4 = 50.
+
+IMPORTANT — not yet device-tested. All checks pass in a local bash sandbox, but
+have NOT run against the live container. Before relying on them:
+1. Rebuild the image:  docker build -t qup-terminal-sandbox:latest ./sandbox
+2. Restart backend, start a FRESH session.
+3. Spot-test across units — especially:
+   - history checks (pwd, ls -l, which, ps, top, nano)
+   - stat-based perms (chmod 644 → uses `stat -c %a`, Linux form, container-correct)
+   - seq/printf-based (head, tail, sort, uniq)
+   - the run-a-script ones (37, 45) — chmod +x + ./run
+Watch for any environment difference (like the earlier tmpfs/history issue) that
+could affect a whole category at once.
