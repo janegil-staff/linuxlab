@@ -1,8 +1,8 @@
-# Terms of Service — Qup Terminal
+# Terms of Service — Linux Lab
 
 _Last updated: 2026_
 
-By using Qup Terminal you agree to these terms.
+By using Linux Lab you agree to these terms.
 
 ## Acceptable use
 

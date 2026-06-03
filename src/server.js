@@ -25,6 +25,7 @@ import authRoutes from "./routes/auth.js";
 import hostsRoutes from "./routes/hosts.js";
 import adminRoutes from "./routes/admin.js";
 import lessonsRoutes from "./routes/lessons.js";
+import legalRoutes from "./routes/legal.js";
 import { Session } from "./models/Session.js";
 import { Host } from "./models/Host.js";
 import { User } from "./models/User.js";
@@ -57,6 +58,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+app.use("/", legalRoutes);
 app.use("/auth", authLimiter, authRoutes);
 app.use("/hosts", apiLimiter, hostsRoutes);
 app.use("/admin", apiLimiter, adminRoutes);

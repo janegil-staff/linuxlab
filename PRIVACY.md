@@ -1,8 +1,8 @@
-# Privacy Policy — Qup Terminal
+# Privacy Policy — Linux Lab
 
 _Last updated: 2026_
 
-Qup Terminal ("the app") is operated by Qup DA. This policy explains what we
+Linux Lab ("the app") is operated by Qup DA. This policy explains what we
 collect and why.
 
 ## What we collect

@@ -1,6 +1,7 @@
 // src/lib/db.js
 // Mongoose connection. MONGODB_URI from env (Atlas or local).
-
+import dotenv from "dotenv";
+dotenv.config();
 import mongoose from "mongoose";
 
 export async function connectDb() {

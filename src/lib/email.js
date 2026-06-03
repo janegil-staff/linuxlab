@@ -5,7 +5,7 @@
 // We keep this dependency-light: nodemailer is imported lazily so the app runs
 // without it installed when email isn't configured.
 
-const FROM = process.env.MAIL_FROM || "Qup Terminal <no-reply@localhost>";
+const FROM = process.env.MAIL_FROM || "Linux Lab <no-reply@localhost>";
 const APP_URL = process.env.APP_PUBLIC_URL || "http://localhost:3000";
 
 export function verifyLink(token) {
@@ -14,8 +14,8 @@ export function verifyLink(token) {
 
 export async function sendVerificationEmail(to, token) {
   const link = verifyLink(token);
-  const subject = "Verify your Qup Terminal account";
-  const text = `Welcome to Qup Terminal.\n\nVerify your account:\n${link}\n\nIf you didn't sign up, ignore this email.`;
+  const subject = "Verify your Linux Lab account";
+  const text = `Welcome to Linux Lab.\n\nVerify your account:\n${link}\n\nIf you didn't sign up, ignore this email.`;
 
   const host = process.env.SMTP_HOST;
   if (!host) {
