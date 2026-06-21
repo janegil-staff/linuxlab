@@ -40,10 +40,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 3000;
 // Bind 0.0.0.0 on App Platform (and anywhere containerised): the platform's
-// health check and ingress reach the process over the network, so 127.0.0.1
-// would refuse them and the instance would be marked unhealthy. Override with
-// HOST only for local-only runs.
-const HOST = process.env.HOST || "0.0.0.0";
+// health check and ingress reach the process over the network, so a loopback
+// bind (127.0.0.1 / localhost) refuses them and the instance is marked
+// unhealthy with "connection refused" on the readiness probe.
+//
+// We resolve HOST defensively. A loopback HOST is only ever right for a purely
+// local run, so we ONLY honour it when there's no sign we're on a platform.
+// App Platform (and most PaaS) inject PORT, so "PORT is set" is our signal that
+// we're deployed — in which case we force 0.0.0.0 even if a stray .env or env
+// var sets HOST=127.0.0.1. This prevents a committed/bundled .env from silently
+// breaking the deploy.
+function resolveHost() {
+  const requested = (process.env.HOST || "").trim();
+  const isLoopback =
+    requested === "127.0.0.1" ||
+    requested === "localhost" ||
+    requested === "::1";
+  // Treat an injected PORT as "running on a platform" (App Platform sets it).
+  const onPlatform = !!process.env.PORT;
+  if (isLoopback && onPlatform) {
+    console.warn(
+      `[startup] ignoring HOST=${requested} on a platform deploy; ` +
+        `binding 0.0.0.0 so the health check can reach the service.`,
+    );
+    return "0.0.0.0";
+  }
+  return requested || "0.0.0.0";
+}
+const HOST = resolveHost();
 // Max concurrent terminal sessions per user (resource-exhaustion guard).
 const MAX_SESSIONS_PER_USER = Number(process.env.MAX_SESSIONS_PER_USER || 5);
 // Hard wall-clock cap per session (ms). 0 disables. (Previously lived in
