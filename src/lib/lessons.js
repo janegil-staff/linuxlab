@@ -1,17 +1,30 @@
 // src/lib/lessons.js
 // Linux-learning curriculum + verification. A lesson is pure data; the engine
-// runs `check` inside the learner's sandbox container and looks for `pass`.
+// runs `check` to look for `pass`.
 //
 // Two verification styles (both just run as `check`):
 //   • side-effect — inspect the filesystem for what the task should have made.
 //   • history     — grep ~/.bash_history to confirm a command was RUN (needed
-//                   for traceless commands like cd, ls, cat, pwd, man). The
-//                   sandbox image writes history immediately (PROMPT_COMMAND).
+//                   for traceless commands like cd, ls, cat, pwd, man).
 //
 // Every lesson is SELF-CONTAINED: its task sets up anything it needs, so a
 // learner can do lessons in any order. Add lessons by appending here — no code.
-
-import pty from "node-pty";
+//
+// VERIFICATION_E2B_V1 — verification now runs the lesson's `check` inside the
+// learner's own E2B sandbox via the backend, replacing the parked Docker path.
+// The backend reconnects to the running sandbox by id (Sandbox.connect) and
+// runs `check` with sandbox.commands.run(). Filesystem checks ($HOME) and
+// history checks (~/.bash_history) both map onto that sandbox.
+//
+// IMPORTANT — history checks require the PTY to flush history continuously.
+// Interactive bash only writes ~/.bash_history on exit, and commands.run()
+// spawns a SEPARATE non-interactive shell that can't see the PTY's in-memory
+// history. So when you start the PTY session, set:
+//     export PROMPT_COMMAND='history -a'
+// (and optionally `shopt -s histappend`) so every Enter flushes the command to
+// ~/.bash_history immediately. Then the backend's commands.run grep sees it.
+// See ensurePtyHistoryFlush() below for the exact snippet to inject at PTY
+// startup.
 
 // Course units (the topic breakdown). Lessons reference a unit by id. Units
 // give the curriculum structure and let the app group + show per-unit progress.
@@ -781,32 +794,125 @@ export function getLesson(id) {
   return LESSONS.find((l) => l.id === id) || null;
 }
 
-export function verifyInContainer(containerName, lesson, timeoutMs = 10000) {
-  return new Promise((resolve) => {
-    if (!containerName) return resolve({ passed: false, output: "no container" });
-    let out = "";
-    let done = false;
-    const finish = (passed) => {
-      if (done) return;
-      done = true;
-      resolve({ passed, output: out });
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    let child;
+// ---------------------------------------------------------------------------
+// VERIFICATION (E2B) — re-enabled.
+//
+// We run the lesson's `check` inside the LEARNER'S OWN sandbox. The backend
+// reconnects to the running sandbox by id and runs `check` non-interactively.
+// Both check styles work there:
+//   • filesystem checks read real disk state ($HOME) — shared with the PTY.
+//   • history checks read ~/.bash_history — PROVIDED the PTY flushes history on
+//     every command (see ensurePtyHistoryFlush below). Without that flush the
+//     PTY keeps history in memory and these checks see an empty/stale file.
+//
+// The E2B Sandbox class is imported lazily so this module never crashes at
+// import time if the SDK or env isn't present (that was the old boot-crash
+// failure mode). We import '@e2b/code-interpreter' if available, else 'e2b'.
+// ---------------------------------------------------------------------------
+
+let _SandboxClassPromise = null;
+
+async function loadSandboxClass() {
+  if (_SandboxClassPromise) return _SandboxClassPromise;
+  _SandboxClassPromise = (async () => {
+    // Prefer the code-interpreter package if the project uses it; fall back to
+    // the base 'e2b' SDK. Both expose the same Sandbox.connect / commands.run.
+    let mod;
     try {
-      child = pty.spawn(
-        "docker",
-        ["exec", containerName, "bash", "-lc", lesson.check],
-        { name: "xterm-color", cols: 80, rows: 24 }
-      );
+      mod = await import("@e2b/code-interpreter");
     } catch {
-      clearTimeout(timer);
-      return finish(false);
+      mod = await import("e2b");
     }
-    child.onData((d) => (out += d));
-    child.onExit(() => {
-      clearTimeout(timer);
-      finish(out.includes(lesson.pass));
+    // Named export in current SDKs; default export in some older builds.
+    return mod.Sandbox || mod.default;
+  })();
+  return _SandboxClassPromise;
+}
+
+// The snippet to inject when you CREATE the PTY session, so that interactive
+// history is flushed to ~/.bash_history after every command. Run this once,
+// right after sandbox.pty.create(), by writing it into the PTY's stdin:
+//
+//   ptySession.sendStdin(ensurePtyHistoryFlush() + "\n")   // or your write fn
+//
+// It is idempotent and harmless to send more than once.
+export function ensurePtyHistoryFlush() {
+  // histappend: don't truncate the file; PROMPT_COMMAND: flush after each cmd.
+  return "shopt -s histappend; export PROMPT_COMMAND='history -a'";
+}
+
+/**
+ * Run a lesson's `check` inside the learner's E2B sandbox and report pass/fail.
+ *
+ * @param {string} sandboxId  The learner's running E2B sandbox id. Store this
+ *                            when you create the PTY (sandbox.sandboxId) and
+ *                            pass it in from the check route.
+ * @param {object} lesson     A lesson object from LESSONS (needs check + pass).
+ * @param {number} timeoutMs  Per-check timeout. Default 10s.
+ * @returns {Promise<{passed: boolean, output: string}>}
+ *
+ * Return shape matches the old verifyInContainer, so existing callers keep
+ * working — they just pass a sandboxId instead of a container name.
+ */
+export async function verifyInSandbox(sandboxId, lesson, timeoutMs = 10000) {
+  if (!sandboxId) {
+    return { passed: false, output: "no-sandbox-id" };
+  }
+  if (!lesson || !lesson.check) {
+    return { passed: false, output: "no-check-defined" };
+  }
+
+  let Sandbox;
+  try {
+    Sandbox = await loadSandboxClass();
+    if (!Sandbox) return { passed: false, output: "e2b-sdk-unavailable" };
+  } catch {
+    return { passed: false, output: "e2b-sdk-unavailable" };
+  }
+
+  let sandbox;
+  try {
+    // Reconnects to the existing sandbox; auto-resumes if it was paused.
+    sandbox = await Sandbox.connect(sandboxId);
+  } catch (err) {
+    // Sandbox expired / killed / wrong id — treat as a clear, non-crashing state.
+    return {
+      passed: false,
+      output: "sandbox-unreachable: " + (err?.message || String(err)),
+    };
+  }
+
+  try {
+    // Run the check in bash via login shell so ~ expands and PATH is sane.
+    // We don't trust exit codes alone — the lesson signals success by echoing
+    // its `pass` token (default "PASS"), exactly like the old Docker path.
+    const result = await sandbox.commands.run(`bash -lc ${shellQuote(lesson.check)}`, {
+      timeoutMs,
     });
-  });
+    const out = ((result?.stdout || "") + (result?.stderr || "")).trim();
+    const passed = out.includes(lesson.pass || "PASS");
+    return { passed, output: out };
+  } catch (err) {
+    // A failing `check` can exit non-zero; some SDK versions throw on non-zero.
+    // Inspect the error's captured output for the pass token before giving up.
+    const captured =
+      (err?.stdout || "") + (err?.stderr || "") + (err?.message || "");
+    const passed = captured.includes(lesson.pass || "PASS");
+    return { passed, output: captured.trim() || "check-failed" };
+  }
+}
+
+// Minimal POSIX single-quote escaper so the whole `check` string is passed to
+// `bash -lc` as ONE argument, with no shell-injection surprises.
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, `'\\''`) + "'";
+}
+
+// ---------------------------------------------------------------------------
+// Back-compat shim. The old export was verifyInContainer(containerName, ...).
+// Callers that still import it keep working: the first arg is now treated as a
+// sandboxId. Update call sites to verifyInSandbox when convenient.
+// ---------------------------------------------------------------------------
+export function verifyInContainer(sandboxIdOrContainer, lesson, timeoutMs = 10000) {
+  return verifyInSandbox(sandboxIdOrContainer, lesson, timeoutMs);
 }

@@ -1,145 +1,129 @@
 // src/lib/sandbox.js
-// Builds the locked-down `docker run` invocation for a session and spawns it as
-// a PTY. The security posture (even with network enabled): unprivileged,
-// non-root, capped CPU/memory/PIDs, read-only root FS with a small writable
-// home+tmp, no privilege escalation, and --rm so the container is destroyed on
-// exit. A compromised session is bounded to its own throwaway container.
+// Disposable practice sandbox backed by E2B (https://e2b.dev) instead of a
+// local Docker container. Each session gets its own Firecracker microVM with a
+// real bash PTY; it's destroyed when the session ends. This replaces the old
+// `docker run` approach so the backend runs as a normal stateless service on
+// App Platform (no Docker daemon, no privileged containers).
+//
+// spawnSandbox() returns the SAME wrapper shape as lib/ssh.js
+// ({ write, resize, kill, onData, onExit }) plus { name }, so server.js treats
+// an E2B sandbox exactly like an SSH session — one code path for both.
+//
+// Requires env: E2B_API_KEY. Optional: SANDBOX_TEMPLATE (a custom E2B template
+// id with your lesson tooling preinstalled; defaults to E2B's base image).
+
 import dotenv from "dotenv";
 dotenv.config();
-import pty from "node-pty";
+import { Sandbox } from "e2b";
 import crypto from "node:crypto";
 
-const IMAGE = process.env.SANDBOX_IMAGE || "qup-terminal-sandbox:latest";
-const MEMORY = process.env.SANDBOX_MEMORY || "512m";
-const CPUS = process.env.SANDBOX_CPUS || "1";
-const PIDS = process.env.SANDBOX_PIDS || "256";
-const TMPFS_SIZE = process.env.SANDBOX_TMPFS || "64m";
-const HOME_SIZE = process.env.SANDBOX_HOME_SIZE || "256m";
-
-// Network mode — defaults to "none" (safest). Options:
-//   none     – no network at all (no apt/pip/npm). Safest.
-//   internal – attach to a Docker network created WITHOUT internet egress
-//              (SANDBOX_NET_NAME). Containers talk to nothing outside.
-//   proxy    – no direct net; HTTP(S)_PROXY points at an allowlist proxy
-//              (SANDBOX_PROXY_URL) so only whitelisted mirrors are reachable.
-//   bridge   – full internet (UNSAFE for public use; explicit opt-in).
-const NETWORK_MODE = process.env.SANDBOX_NETWORK || "none";
-const NET_NAME = process.env.SANDBOX_NET_NAME || "qupterm-internal";
-const PROXY_URL = process.env.SANDBOX_PROXY_URL || "";
-
-// Hard wall-clock cap per session (ms). 0 disables.
+const TEMPLATE = process.env.SANDBOX_TEMPLATE || undefined; // undefined = base
+// Hard wall-clock cap per session (ms). Mirrors the old export so server.js can
+// keep importing SESSION_TIMEOUT_MS from here unchanged.
 export const SESSION_TIMEOUT_MS = Number(
-  process.env.SANDBOX_TIMEOUT_MS || 60 * 60 * 1000 // 1 hour
+  process.env.SANDBOX_TIMEOUT_MS || 60 * 60 * 1000, // 1 hour
+);
+// E2B sandbox lifetime (ms). The sandbox VM is auto-killed after this even if
+// our process dies, so orphaned sandboxes can't run forever and rack up cost.
+const SANDBOX_LIFETIME_MS = Number(
+  process.env.SANDBOX_LIFETIME_MS || SESSION_TIMEOUT_MS,
 );
 
 export function makeContainerName() {
   return `qupterm_${crypto.randomBytes(6).toString("hex")}`;
 }
 
-// Map the network mode to docker flags + extra env.
-function networkArgs() {
-  switch (NETWORK_MODE) {
-    case "bridge":
-      // Full internet. UNSAFE for public use — explicit opt-in only.
-      return { args: ["--network", "bridge"], env: [] };
-    case "internal":
-      // A Docker network created with --internal (no egress). Operator must
-      // create it: docker network create --internal qupterm-internal
-      return { args: ["--network", NET_NAME], env: [] };
-    case "proxy": {
-      // No direct network; everything must go through the allowlist proxy.
-      // The proxy itself lives on an internal docker network the container can
-      // reach, so we attach to that network and inject proxy env vars.
-      const env = [];
-      if (PROXY_URL) {
-        env.push(
-          "--env", `HTTP_PROXY=${PROXY_URL}`,
-          "--env", `HTTPS_PROXY=${PROXY_URL}`,
-          "--env", `http_proxy=${PROXY_URL}`,
-          "--env", `https_proxy=${PROXY_URL}`
-        );
-      }
-      return { args: ["--network", NET_NAME], env };
-    }
-    case "none":
-    default:
-      return { args: ["--network", "none"], env: [] };
-  }
-}
-
-// Build the docker run argument list. Kept as an array (no shell parsing).
-export function buildDockerArgs({ name, cols, rows }) {
-  const net = networkArgs();
-  const args = [
-    "run",
-    "-i",
-    "--rm",
-    "--name",
-    name,
-    // Interactive TTY sized to the client.
-    "--tty",
-    // Network (mode-dependent — defaults to none):
-    ...net.args,
-    // Isolation / hardening:
-    "--cap-drop=ALL",
-    "--security-opt=no-new-privileges",
-    "--read-only", // root FS read-only…
-    // …but give writable, size-limited tmpfs for the places that need it:
-    "--tmpfs",
-    `/tmp:rw,size=${TMPFS_SIZE},mode=1777`,
-    "--tmpfs",
-    `/home/sandbox:rw,size=${HOME_SIZE},mode=0755,uid=1000,gid=1000`,
-    // Resource caps:
-    "--memory",
-    MEMORY,
-    "--memory-swap",
-    MEMORY, // disallow swap beyond memory
-    "--cpus",
-    CPUS,
-    "--pids-limit",
-    PIDS,
-    // Proxy env (proxy mode only):
-    ...net.env,
-    // Initial terminal size via env (xterm honours these on start).
-    "--env",
-    `COLUMNS=${cols || 80}`,
-    "--env",
-    `LINES=${rows || 24}`,
-    IMAGE,
-    "/bin/bash",
-    "-l",
-  ];
-  return args;
-}
-
-// Spawn a sandbox PTY. Returns { shell, name }. Throws if docker isn't usable.
-export function spawnSandbox({ cols = 80, rows = 24 } = {}) {
+// Spawn an E2B sandbox + interactive bash PTY. Returns a Promise resolving to
+// { shell, name } where `shell` is the PTY wrapper. ASYNC (unlike the old
+// docker spawn) because creating the VM is a network call — server.js already
+// awaits openSshSession the same way, so this fits the existing flow.
+export async function spawnSandbox({ cols = 80, rows = 24 } = {}) {
   const name = makeContainerName();
-  const args = buildDockerArgs({ name, cols, rows });
-  const shell = pty.spawn("docker", args, {
-    name: "xterm-color",
+
+  // Create the microVM. Keep it alive long enough for a full session.
+  const sandbox = await Sandbox.create(TEMPLATE, {
+    timeoutMs: SANDBOX_LIFETIME_MS,
+  });
+
+  const dataCbs = [];
+  const exitCbs = [];
+  let exited = false;
+
+  // Start the interactive PTY. onData streams raw bytes (Uint8Array) → fan out
+  // to our listeners as-is (server.js forwards bytes straight to the WS).
+  const pty = await sandbox.pty.create({
     cols,
     rows,
-    cwd: process.env.HOME || process.cwd(),
-    env: process.env,
+    timeoutMs: 0, // keep the PTY open indefinitely; we enforce our own timeout
+    onData: (data) => {
+      for (const cb of dataCbs) cb(data);
+    },
   });
-  return { shell, name };
-}
+  const pid = pty.pid;
 
-// Best-effort hard kill of a container by name (used on timeout/cleanup).
-export function killContainer(name) {
-  if (!name) return;
-  try {
-    const k = pty.spawn("docker", ["kill", name], { cols: 80, rows: 24 });
-    // Let it run and exit on its own; we don't need the output.
-    setTimeout(() => {
+  // When the PTY process finishes, notify exit listeners and tear down the VM.
+  // pty handles expose wait() (resolves when the PTY exits).
+  pty
+    .wait()
+    .then(() => fireExit(0))
+    .catch(() => fireExit(1));
+
+  function fireExit(code) {
+    if (exited) return;
+    exited = true;
+    for (const cb of exitCbs) cb({ exitCode: code });
+    // Best-effort: kill the whole sandbox VM so nothing lingers/bills.
+    sandbox.kill().catch(() => {});
+  }
+
+  const shell = {
+    write: (data) => {
+      // data may be a string (text frame) or Buffer (binary frame); E2B wants
+      // a Uint8Array.
       try {
-        k.kill();
+        const bytes =
+          typeof data === "string"
+            ? new TextEncoder().encode(data)
+            : new Uint8Array(data);
+        sandbox.pty.sendInput(pid, bytes).catch(() => {});
+      } catch {
+        /* sandbox gone */
+      }
+    },
+    resize: (c, r) => {
+      try {
+        sandbox.pty.resize(pid, { cols: c, rows: r }).catch(() => {});
       } catch {
         /* ignore */
       }
-    }, 5000);
+    },
+    kill: () => {
+      try {
+        sandbox.pty.kill(pid).catch(() => {});
+      } catch {
+        /* ignore */
+      }
+      // Also destroy the VM (don't wait).
+      sandbox.kill().catch(() => {});
+      fireExit(0);
+    },
+    onData: (cb) => dataCbs.push(cb),
+    onExit: (cb) => exitCbs.push(cb),
+    // Expose the underlying sandbox id for logging/cleanup if needed.
+    _sandboxId: sandbox.sandboxId,
+  };
+
+  return { shell, name };
+}
+
+// Best-effort kill of a sandbox by its E2B id (used on timeout/cleanup).
+// Kept for API-compatibility with the old killContainer(name); now takes the
+// sandbox id stored on the session. Safe no-op if id is missing/already gone.
+export async function killContainer(sandboxId) {
+  if (!sandboxId) return;
+  try {
+    await Sandbox.kill(sandboxId);
   } catch {
-    /* docker gone or already removed */
+    /* already gone */
   }
 }

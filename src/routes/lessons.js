@@ -56,11 +56,20 @@ router.get("/", async (req, res) => {
   });
 });
 
-// POST /lessons/:id/verify — check work; record completion on pass
+// POST /lessons/:id/verify — check work; record completion on pass.
+//
+// Always responds 200 with a JSON body the app can act on:
+//   { passed: true }                              → correct
+//   { passed: false }                             → ran the check, wrong answer
+//   { passed: false, reason: "no_session" }       → no live sandbox to check in
+//   { passed: false, reason: "sandbox_closed" }   → the sandbox has ended
+// The app shows a helpful "open the terminal and run the command" nudge for the
+// reason cases, instead of treating them as a hard error.
 router.post("/:id/verify", async (req, res) => {
   const lesson = getLesson(req.params.id);
   if (!lesson) return res.status(404).json({ error: "unknown lesson" });
 
+  // Most recent active sandbox session for this user.
   const session = await Session.findOne({
     userId: req.userId,
     kind: "sandbox",
@@ -68,19 +77,47 @@ router.post("/:id/verify", async (req, res) => {
   }).sort({ startedAt: -1 });
 
   if (!session || !session.containerId) {
-    return res.status(409).json({
-      error: "no_active_session",
-      message: "Open a terminal session first, then check your work.",
+    return res.json({
+      passed: false,
+      reason: "no_session",
+      message: "Open the terminal, run the command, then check your work.",
     });
   }
 
-  const result = await verifyInContainer(session.containerId, lesson);
+  let result;
+  try {
+    result = await verifyInContainer(session.containerId, lesson);
+  } catch (e) {
+    // verifyInContainer is written not to throw, but stay defensive so a check
+    // failure never surfaces to the app as a 500.
+    console.error("verify threw:", e?.message || e);
+    result = { passed: false, output: "verify-error" };
+  }
+
+  // The sandbox VM was gone/unreachable (e.g. the practice session closed
+  // before the user tapped check). Tell the app to reopen, don't error.
+  if (
+    !result.passed &&
+    typeof result.output === "string" &&
+    (result.output.startsWith("sandbox-unreachable") ||
+      result.output === "no-sandbox-id" ||
+      result.output === "e2b-sdk-unavailable")
+  ) {
+    return res.json({
+      passed: false,
+      reason: "sandbox_closed",
+      message:
+        "Your practice session has closed. Open the terminal again, run the command, then check.",
+    });
+  }
+
   if (result.passed) {
     await User.updateOne(
       { _id: req.userId },
       { $addToSet: { completedLessons: lesson.id } }
     );
   }
+
   res.json({ passed: result.passed });
 });
 

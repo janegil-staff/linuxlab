@@ -2,15 +2,15 @@
 // Qup Terminal backend — auth + DB + PTY-over-WebSocket.
 //
 //   - REST: /auth (register/login/refresh/me)
-//   - WS /term?token=<accessJWT> : authenticated terminal session
-//   - spawns a shell (PTY) per connection and pipes it both ways
+//   - WS /term?token=<accessJWT>[&hostId=<id>] : authenticated terminal session
+//       • with hostId  → SSH shell on the user's OWN host (lib/ssh.js)
+//       • without      → disposable E2B practice sandbox (lib/sandbox.js)
 //
-// Still TODO before public exposure (next steps):
-//   - Docker-per-session sandbox (currently the shell runs as THIS process user)
-//   - SSH-out to user hosts
-//   - rate limiting / concurrent-session caps
-//
-// ⚠️  Until the sandbox lands, keep this on localhost / trusted networks.
+// DEPLOY NOTE (App Platform): runs as a normal stateless API + WS service. The
+// old Docker-per-session sandbox is gone; the practice sandbox is now an E2B
+// microVM (remote API, no local Docker), so this works on App Platform. Both
+// SSH and sandbox sessions use the SAME shell wrapper shape, so the WS bridge
+// below treats them identically.
 
 import http from "node:http";
 import path from "node:path";
@@ -32,28 +32,33 @@ import { Host } from "./models/Host.js";
 import { User } from "./models/User.js";
 import { decrypt } from "./lib/crypto.js";
 import { openSshSession } from "./lib/ssh.js";
+import { spawnSandbox, killContainer } from "./lib/sandbox.js";
+import { ensurePtyHistoryFlush } from "./lib/lessons.js";
 import { authLimiter, apiLimiter } from "./middleware/rateLimit.js";
-import {
-  spawnSandbox,
-  killContainer,
-  SESSION_TIMEOUT_MS,
-} from "./lib/sandbox.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || "127.0.0.1";
+// Bind 0.0.0.0 on App Platform (and anywhere containerised): the platform's
+// health check and ingress reach the process over the network, so 127.0.0.1
+// would refuse them and the instance would be marked unhealthy. Override with
+// HOST only for local-only runs.
+const HOST = process.env.HOST || "0.0.0.0";
 // Max concurrent terminal sessions per user (resource-exhaustion guard).
 const MAX_SESSIONS_PER_USER = Number(process.env.MAX_SESSIONS_PER_USER || 5);
-
+// Hard wall-clock cap per session (ms). 0 disables. (Previously lived in
+// sandbox.js; re-homed here so SSH sessions keep the cap.)
+const SESSION_TIMEOUT_MS = Number(
+  process.env.SESSION_TIMEOUT_MS || 60 * 60 * 1000, // 1 hour
+);
 
 // ── Message protocol ─────────────────────────────────────────────────────────
 // client → server: JSON control { type:"resize"|"ping" } else raw keystrokes
 // server → client: raw bytes are output; JSON for { type:"exit"|"error"|"pong" }
 
 const app = express();
-// Behind a reverse proxy (Caddy/nginx) in production, so per-IP rate limiting
-// uses the real client IP from X-Forwarded-For.
+// Behind the App Platform / proxy ingress, so per-IP rate limiting uses the
+// real client IP from X-Forwarded-For.
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
@@ -94,6 +99,7 @@ server.on("upgrade", (req, socket, head) => {
   // Authenticated — carry the user id (and optional hostId) into the connection.
   req.userId = payload.sub;
   req.hostId = url.searchParams.get("hostId") || null;
+
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit("connection", ws, req);
   });
@@ -103,16 +109,15 @@ wss.on("connection", async (ws, req) => {
   const userId = req.userId;
   const hostId = req.hostId;
   const isSsh = !!hostId;
-  console.log(
-    `[+] ${isSsh ? "ssh" : "sandbox"} session opened (user ${userId})`
-  );
+
+  console.log(`[+] ${isSsh ? "ssh" : "sandbox"} session opened (user ${userId})`);
 
   // Reject banned users immediately (their token may still be valid).
   try {
     const u = await User.findById(userId).select("banned");
     if (u && u.banned) {
       ws.send(
-        JSON.stringify({ type: "error", message: "Account suspended." })
+        JSON.stringify({ type: "error", message: "Account suspended." }),
       );
       ws.close();
       return;
@@ -129,7 +134,7 @@ wss.on("connection", async (ws, req) => {
         JSON.stringify({
           type: "error",
           message: `Session limit reached (${MAX_SESSIONS_PER_USER}). Close another session first.`,
-        })
+        }),
       );
       ws.close();
       return;
@@ -138,7 +143,7 @@ wss.on("connection", async (ws, req) => {
     console.error("session count failed:", e.message);
     // Fail closed on the cap check — safer to refuse than to allow unbounded.
     ws.send(
-      JSON.stringify({ type: "error", message: "Could not start session." })
+      JSON.stringify({ type: "error", message: "Could not start session." }),
     );
     ws.close();
     return;
@@ -160,10 +165,12 @@ wss.on("connection", async (ws, req) => {
   }
 
   let shell;
-  let containerName = null;
+  // For sandbox sessions, the E2B sandbox id (stored on the Session row) lets
+  // admin/cleanup kill the VM out-of-band. SSH sessions leave this null.
+  let sandboxId = null;
 
   if (isSsh) {
-    // ── SSH to the user's own server ───────────────────────────────────────
+    // ── SSH to the user's own server ─────────────────────────────────────────
     try {
       const host = await Host.findOne({ _id: hostId, userId });
       if (!host) throw new Error("host not found");
@@ -195,39 +202,63 @@ wss.on("connection", async (ws, req) => {
           JSON.stringify({
             type: "error",
             message: `SSH connection failed: ${err.message}`,
-          })
+          }),
         );
         ws.close();
+      }
+      // Mark the just-created session row ended so it doesn't linger "active".
+      if (sessionDoc) {
+        sessionDoc.status = "error";
+        sessionDoc.endedAt = new Date();
+        sessionDoc.save().catch(() => {});
       }
       return;
     }
   } else {
-    // ── Disposable, locked-down Docker container ───────────────────────────
+    // ── Disposable E2B practice sandbox ──────────────────────────────────────
     try {
-      const res = spawnSandbox({ cols: 80, rows: 24 });
+      const res = await spawnSandbox({ cols: 80, rows: 24 });
       shell = res.shell;
-      containerName = res.name;
-      if (sessionDoc) {
-        sessionDoc.containerId = containerName;
+      sandboxId = shell._sandboxId || null;
+      if (sessionDoc && sandboxId) {
+        // Reuse the existing containerId field to store the E2B sandbox id.
+        sessionDoc.containerId = sandboxId;
         sessionDoc.save().catch(() => {});
       }
-      console.log(`[+] sandbox container ${containerName} (user ${userId})`);
+      console.log(`[+] sandbox ${res.name} (e2b ${sandboxId}) user ${userId}`);
+
+      // Flush interactive history to ~/.bash_history after every command, so
+      // the lesson verifier (which greps that file from a SEPARATE non-login
+      // shell via commands.run) can see traceless commands like pwd / ls / cd.
+      // Without this, the PTY keeps history in memory and those checks fail
+      // even on correct answers. Idempotent; safe to send once at startup.
+      try {
+        shell.write(ensurePtyHistoryFlush() + "\n");
+      } catch (e) {
+        console.error("history-flush setup failed:", e.message);
+      }
     } catch (err) {
       console.error("sandbox spawn failed:", err.message);
       if (ws.readyState === ws.OPEN) {
         ws.send(
           JSON.stringify({
             type: "error",
-            message: `Failed to start session: ${err.message}`,
-          })
+            message:
+              "Could not start the practice sandbox. Please try again in a moment.",
+          }),
         );
         ws.close();
+      }
+      if (sessionDoc) {
+        sessionDoc.status = "error";
+        sessionDoc.endedAt = new Date();
+        sessionDoc.save().catch(() => {});
       }
       return;
     }
   }
 
-  // Hard wall-clock timeout for both kinds.
+  // Hard wall-clock timeout.
   let timeoutHandle = null;
   if (SESSION_TIMEOUT_MS > 0) {
     timeoutHandle = setTimeout(() => {
@@ -237,20 +268,20 @@ wss.on("connection", async (ws, req) => {
           JSON.stringify({
             type: "error",
             message: "Session timed out and was closed.",
-          })
+          }),
         );
         ws.close();
       }
-      if (containerName) killContainer(containerName);
+      if (sandboxId) killContainer(sandboxId);
     }, SESSION_TIMEOUT_MS);
   }
 
-  // PTY → client: stream output as raw bytes.
+  // shell → client: stream output as raw bytes (SSH or sandbox).
   shell.onData((data) => {
     if (ws.readyState === ws.OPEN) ws.send(data);
   });
 
-  // PTY exit → tell the client, then close.
+  // shell exit → tell the client, then close.
   shell.onExit(({ exitCode }) => {
     console.log(`[-] shell exited (code ${exitCode})`);
     if (ws.readyState === ws.OPEN) {
@@ -260,9 +291,8 @@ wss.on("connection", async (ws, req) => {
     cleanup("ended", exitCode);
   });
 
-  // client → PTY: control JSON or raw keystrokes.
+  // client → shell: control JSON or raw keystrokes (SSH or sandbox).
   ws.on("message", (raw, isBinary) => {
-    // Try to parse a control message first (only for text frames).
     if (!isBinary) {
       const text = raw.toString();
       if (text.length && text[0] === "{") {
@@ -311,9 +341,8 @@ wss.on("connection", async (ws, req) => {
     } catch {
       /* already gone */
     }
-    // --rm usually removes the container on exit, but force-kill defensively in
-    // case the client vanished while the shell was mid-command.
-    killContainer(containerName);
+    // For sandbox sessions, also destroy the E2B VM so nothing lingers/bills.
+    if (sandboxId) killContainer(sandboxId);
     if (sessionDoc) {
       try {
         sessionDoc.status = status || "ended";
@@ -338,13 +367,13 @@ wss.on("connection", async (ws, req) => {
 
 async function start() {
   await connectDb();
-  // Any session still "active" in the DB after a restart is orphaned (its
-  // container/SSH conn died with the old process). Mark them ended so the
-  // per-user concurrent cap isn't blocked by ghosts.
+  // Any session still "active" in the DB after a restart is orphaned (its SSH
+  // conn died with the old process). Mark them ended so the per-user
+  // concurrent cap isn't blocked by ghosts.
   try {
     const r = await Session.updateMany(
       { status: "active" },
-      { $set: { status: "ended", endedAt: new Date() } }
+      { $set: { status: "ended", endedAt: new Date() } },
     );
     if (r.modifiedCount) {
       console.log(`[startup] cleared ${r.modifiedCount} orphaned session(s)`);
@@ -355,9 +384,9 @@ async function start() {
   server.listen(PORT, HOST, () => {
     console.log(`Qup Terminal backend`);
     console.log(`  HTTP  : http://${HOST}:${PORT}  (/auth, /health)`);
-    console.log(`  WS    : ws://${HOST}:${PORT}/term?token=<accessJWT>`);
+    console.log(`  WS    : ws://${HOST}:${PORT}/term?token=<accessJWT>&hostId=<id>`);
     console.log(
-      `  Auth  : ON   Sandbox: ON   Max sessions/user: ${MAX_SESSIONS_PER_USER}`
+      `  Auth  : ON   Sandbox: E2B   Max sessions/user: ${MAX_SESSIONS_PER_USER}`,
     );
   });
 }
