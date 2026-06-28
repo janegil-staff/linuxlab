@@ -11,6 +11,13 @@
 //
 // Requires env: E2B_API_KEY. Optional: SANDBOX_TEMPLATE (a custom E2B template
 // id with your lesson tooling preinstalled; defaults to E2B's base image).
+//
+// HARDENING NOTE: every callback the E2B SDK invokes (onData, and the
+// pty.wait() resolution) is wrapped so a throw can never escape into an
+// unhandled exception and crash the whole service. Teardown is idempotent:
+// pty.wait(), our kill(), and server.js's cleanup() can all fire in any order
+// without double-killing the VM or double-firing exit listeners. This is what
+// stops the "run a command → backend restarts" crash.
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -47,37 +54,75 @@ export async function spawnSandbox({ cols = 80, rows = 24 } = {}) {
 
   const dataCbs = [];
   const exitCbs = [];
-  let exited = false;
+  let exited = false; // guards exit fan-out + VM kill (idempotent teardown)
+  let killing = false; // guards the VM kill itself (don't kill twice)
 
-  // Start the interactive PTY. onData streams raw bytes (Uint8Array) → fan out
-  // to our listeners as-is (server.js forwards bytes straight to the WS).
+  // Destroy the VM at most once. Safe to call from any teardown path.
+  function killVm() {
+    if (killing) return;
+    killing = true;
+    Promise.resolve()
+      .then(() => sandbox.kill())
+      .catch(() => {
+        /* already gone / network hiccup — nothing to do */
+      });
+  }
+
+  // Fire exit listeners exactly once, then tear down the VM. Every listener is
+  // wrapped: a throwing onExit handler must not prevent VM cleanup or escape.
+  function fireExit(code) {
+    if (exited) return;
+    exited = true;
+    for (const cb of exitCbs) {
+      try {
+        cb({ exitCode: code });
+      } catch (e) {
+        console.error("sandbox onExit cb failed:", e && e.message);
+      }
+    }
+    killVm();
+  }
+
+  // Start the interactive PTY. The E2B base PTY is an interactive bash shell
+  // with TERM=xterm-256color, so no cmd/args needed. onData streams raw bytes
+  // (Uint8Array) → fan out to listeners as-is (server.js forwards them to WS).
   const pty = await sandbox.pty.create({
     cols,
     rows,
     timeoutMs: 0, // keep the PTY open indefinitely; we enforce our own timeout
     onData: (data) => {
-      for (const cb of dataCbs) cb(data);
+      // Drop any trailing frames that arrive after exit/kill — forwarding them
+      // can throw on a closing socket and is pointless once we're tearing down.
+      if (exited) return;
+      for (const cb of dataCbs) {
+        try {
+          cb(data);
+        } catch (e) {
+          console.error("sandbox onData cb failed:", e && e.message);
+        }
+      }
     },
   });
   const pid = pty.pid;
 
   // When the PTY process finishes, notify exit listeners and tear down the VM.
-  // pty handles expose wait() (resolves when the PTY exits).
-  pty
-    .wait()
-    .then(() => fireExit(0))
-    .catch(() => fireExit(1));
-
-  function fireExit(code) {
-    if (exited) return;
-    exited = true;
-    for (const cb of exitCbs) cb({ exitCode: code });
-    // Best-effort: kill the whole sandbox VM so nothing lingers/bills.
-    sandbox.kill().catch(() => {});
-  }
+  // wait() resolves to a result with an exitCode; fall back to 0 if absent.
+  // Wrapped so a rejection here can never become an unhandledRejection.
+  Promise.resolve()
+    .then(() => pty.wait())
+    .then((result) => {
+      const code =
+        result && typeof result.exitCode === "number" ? result.exitCode : 0;
+      fireExit(code);
+    })
+    .catch((e) => {
+      console.error("pty.wait() rejected:", e && e.message);
+      fireExit(1);
+    });
 
   const shell = {
     write: (data) => {
+      if (exited) return;
       // data may be a string (text frame) or Buffer (binary frame); E2B wants
       // a Uint8Array.
       try {
@@ -85,26 +130,31 @@ export async function spawnSandbox({ cols = 80, rows = 24 } = {}) {
           typeof data === "string"
             ? new TextEncoder().encode(data)
             : new Uint8Array(data);
-        sandbox.pty.sendInput(pid, bytes).catch(() => {});
+        Promise.resolve(sandbox.pty.sendInput(pid, bytes)).catch(() => {
+          /* sandbox gone mid-write — ignore */
+        });
       } catch {
         /* sandbox gone */
       }
     },
     resize: (c, r) => {
+      if (exited) return;
       try {
-        sandbox.pty.resize(pid, { cols: c, rows: r }).catch(() => {});
+        Promise.resolve(sandbox.pty.resize(pid, { cols: c, rows: r })).catch(
+          () => {},
+        );
       } catch {
         /* ignore */
       }
     },
     kill: () => {
+      // Kill the PTY process; the VM is destroyed by fireExit → killVm.
       try {
-        sandbox.pty.kill(pid).catch(() => {});
+        Promise.resolve(sandbox.pty.kill(pid)).catch(() => {});
       } catch {
         /* ignore */
       }
-      // Also destroy the VM (don't wait).
-      sandbox.kill().catch(() => {});
+      // fireExit's `exited` guard makes this safe even if wait() already fired.
       fireExit(0);
     },
     onData: (cb) => dataCbs.push(cb),
